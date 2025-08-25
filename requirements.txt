@@ -3,3 +3,4 @@ PyMySQL==1.1.1
 gmssl==3.2.2
 Django==4.2.16
 tqdm==4.66.6
+psycopg2==2.9.10

@@ -5,6 +5,8 @@ import config
 from ctypes import *
 from pycryptodo import math
 from tqdm import tqdm
+import psycopg2
+import psycopg2.extras
 
 cipher_alg_id = {
     "sm4_ebc": 0x00000401,
@@ -306,22 +308,22 @@ class SM4Mixin(BaseMixin):
         return temp_data[:temp_data_length.value]
 
 
-def get_mysql_conn():  
-    try:  
-        conn = pymysql.connect(  
-            host=config.host,  
-            port=config.port,  
-            user=config.user,  
-            password=config.password,  
-            database=config.database  
-        )  
-        return conn  
-    except pymysql.MySQLError as e:  
-        print(f"Error connecting to MySQL Database: {e}") 
-        return None  
-    except Exception as e:  
-        print(f"An unexpected error occurred: {e}")  
-        return None 
+def get_mysql_conn():
+    try:
+        conn = pymysql.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            database=config.database
+        )
+        return conn
+    except pymysql.MySQLError as e:
+        print(f"Error connecting to MySQL Database: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None
 
 
 class Session(SM2Mixin, SM3Mixin, SM4Mixin):
@@ -352,7 +354,7 @@ class Session(SM2Mixin, SM3Mixin, SM4Mixin):
     def close(self):
         ret = self._driver.SDF_CloseSession(self._session)
         if ret != 0:
-            raise PiicoError("close session failed", ret) 
+            raise PiicoError("close session failed", ret)
 
 class Device:
     _driver = None
@@ -442,26 +444,44 @@ def get_jp_info(conn):
     return result
 
 
-def read_text_file(file_path):  
-    try:  
-        with open(file_path, 'r') as file:  
-            return file.read()  
-    except FileNotFoundError:  
-        print(f"File not found: {file_path}")  
-        return None  
+def get_postgresql_conn():
+    conn = psycopg2.connect(dbname=config.database, user=config.user, password=config.password, host=config.host, port=config.port)
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-def write_data_to_file(file, data):  
-    writer = csv.DictWriter(file, fieldnames=['account_name', 'username', 'secret_type', 'secret', 'is_active', 'address', 'asset_name', 'platform_name', 'type'])  
-    writer.writeheader()  
-    for e in tqdm(data):  
-        crypto = math.Crypto(e, config.SECRET_KEY)  
-        e['secret'] = crypto.decrypt()  
-        writer.writerow(e)  
+    sql = 'SELECT accounts_account.name AS account_name,accounts_account.username,accounts_account.secret_type,accounts_account._secret AS secret,accounts_account.is_active,assets_asset.address,assets_asset.name AS asset_name,assets_platform.name AS platform_name,assets_platform.type FROM accounts_account INNER JOIN assets_asset ON accounts_account.asset_id = assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id = assets_platform.id;'
+    cursor.execute(sql)
+    result = cursor.fetchall()
+    conn.close()
+    # 需要转成 list[dict]，跟 MySQL 统一
+    return [dict(row) for row in result]
 
-if __name__ == "__main__":  
-    conn = get_mysql_conn()   
-    result = get_jp_info(conn)  
-    f = open("jumpserver.csv", 'w', newline='')    
-    write_data_to_file(f, result)  
-    f.close() 
-    conn.close() 
+def read_text_file(file_path):
+    try:
+        with open(file_path, 'r') as file:
+            return file.read()
+    except FileNotFoundError:
+        print(f"File not found: {file_path}")
+        return None
+
+def write_data_to_file(file, data):
+    writer = csv.DictWriter(file, fieldnames=['account_name', 'username', 'secret_type', 'secret', 'is_active', 'address', 'asset_name', 'platform_name', 'type'])
+    writer.writeheader()
+    for e in tqdm(data):
+        crypto = math.Crypto(e, config.SECRET_KEY)
+        e['secret'] = crypto.decrypt()
+        writer.writerow(e)
+
+
+
+if __name__ == "__main__":
+    result = ()
+    if config.type == 1:
+        conn = get_mysql_conn()
+        result = get_jp_info(conn)
+        conn.close()
+    if config.type == 2:
+        result = get_postgresql_conn()
+
+    f = open("jumpserver.csv", 'w', newline='')
+    write_data_to_file(f, result)
+    f.close()
