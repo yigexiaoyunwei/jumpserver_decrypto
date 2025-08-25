@@ -3,13 +3,18 @@ name: Build and Release
 on:
   push:
     tags:
-      - "v*"   # 当推送 tag，如 v1.0.0 时触发
-  workflow_dispatch:   # 也可以手动触发
+      - "v*"
+  workflow_dispatch:
 
 jobs:
-  build-linux:
-    name: Build Linux binary
-    runs-on: ubuntu-latest
+  build:
+    name: Build binaries on ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        arch: [x64, arm64]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,100 +30,55 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build Linux binary
-        run: pyinstaller --onefile main.py
+      - name: Build binary
+        run: |
+          if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+            pyinstaller --onefile main.py --name main-${{ matrix.os }}-${{ matrix.arch }}
+          else
+            pyinstaller --onefile main.py --name main-${{ matrix.os }}-${{ matrix.arch }}.exe
         shell: bash
 
-      - name: Upload Linux artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-binary
-          path: dist/main*
-
-  build-windows:
-    name: Build Windows binary
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Build Windows binary
-        run: pyinstaller --onefile main.py
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-binary
-          path: dist/main*
-
-  build-macos:
-    name: Build macOS binary
-    runs-on: macos-13
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Build macOS binary
-        run: pyinstaller --onefile main.py
-        shell: bash
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-binary
-          path: dist/main*
+          name: ${{ matrix.os }}-${{ matrix.arch }}-binary
+          path: dist/*
 
   release:
-    name: Create Release
-    needs: [build-linux, build-windows, build-macos]
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download Linux artifact
+      - name: Download Linux x64
         uses: actions/download-artifact@v4
         with:
-          name: linux-binary
-          path: dist/linux
+          name: ubuntu-latest-x64-binary
+          path: dist/linux/x64
 
-      - name: Download Windows artifact
+      - name: Download Linux ARM
         uses: actions/download-artifact@v4
         with:
-          name: windows-binary
-          path: dist/windows
+          name: ubuntu-latest-arm64-binary
+          path: dist/linux/arm64
 
-      - name: Download macOS artifact
+      - name: Download Windows x64
         uses: actions/download-artifact@v4
         with:
-          name: macos-binary
-          path: dist/macos
+          name: windows-latest-x64-binary
+          path: dist/windows/x64
+
+      - name: Download Windows ARM
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-latest-arm64-binary
+          path: dist/windows/arm64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/linux/*
-            dist/windows/*
-            dist/macos/*
+            dist/linux/x64/*
+            dist/linux/arm64/*
+            dist/windows/x64/*
+            dist/windows/arm64/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
