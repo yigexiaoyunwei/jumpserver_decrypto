@@ -1,0 +1,8 @@
+database:
+  type: 1            # 1=MySQL, 2=PostgreSQL
+  host: "127.0.0.1"
+  port: 3303
+  user: "root"
+  password: "root"
+  name: "jumpserver"
+  secret_key: "NNNNNzQ1NDQtMDA1Mi0zNTEwLTgwNGUtYXXXXXXmMzM1NNNN"
