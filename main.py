@@ -1,12 +1,187 @@
-import pymysql
-from pymysql import cursors
 import csv
-import config
+import configparser
+import importlib.util
+import sys
 from ctypes import *
-from pycryptodo import math
-from tqdm import tqdm
+from pathlib import Path
+from types import SimpleNamespace
+
 import psycopg2
 import psycopg2.extras
+import pymysql
+from pycryptodo import math
+from tqdm import tqdm
+from pymysql import cursors
+
+
+def get_runtime_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resolve_runtime_file(path):
+    candidate = Path(path)
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+
+    for base_dir in (Path.cwd(), get_runtime_dir()):
+        resolved = base_dir / path
+        if resolved.exists():
+            return resolved
+
+    return get_runtime_dir() / path
+
+
+def _normalize_database_config(raw_config):
+    if raw_config is None:
+        raise ValueError("empty config data")
+
+    database = raw_config.get("database", raw_config)
+    if not isinstance(database, dict):
+        raise ValueError("database config must be a mapping")
+
+    def pick(*keys):
+        for key in keys:
+            value = database.get(key)
+            if value is not None and str(value).strip() != "":
+                return value
+        return None
+
+    db_type = pick("type", "db_type")
+    host = pick("host")
+    port = pick("port")
+    user = pick("user", "username")
+    password = pick("password", "passwd")
+    db_name = pick("name", "database", "db_name")
+    secret_key = pick("secret_key", "SECRET_KEY", "secret")
+
+    missing = []
+    if host is None:
+        missing.append("host")
+    if port is None:
+        missing.append("port")
+    if user is None:
+        missing.append("user")
+    if password is None:
+        missing.append("password")
+    if db_name is None:
+        missing.append("name/database")
+    if secret_key is None:
+        missing.append("secret_key/SECRET_KEY")
+    if missing:
+        raise KeyError("missing required config fields: {}".format(", ".join(missing)))
+
+    return SimpleNamespace(
+        type=int(db_type) if db_type is not None else 1,
+        host=str(host),
+        port=int(port),
+        user=str(user),
+        password=str(password),
+        database=str(db_name),
+        SECRET_KEY=str(secret_key),
+    )
+
+
+def load_yaml_config(path="config.yml"):
+    config_path = resolve_runtime_file(path)
+    if not config_path.exists():
+        return None
+
+    import yaml
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return _normalize_database_config(cfg)
+
+
+def load_python_config(path="config.py"):
+    config_path = resolve_runtime_file(path)
+    if not config_path.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location("runtime_config", config_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    cfg = {
+        "type": getattr(module, "type", 1),
+        "host": getattr(module, "host", None),
+        "port": getattr(module, "port", None),
+        "user": getattr(module, "user", None),
+        "password": getattr(module, "password", None),
+        "database": getattr(module, "database", None),
+        "SECRET_KEY": getattr(module, "SECRET_KEY", None),
+    }
+    return _normalize_database_config(cfg)
+
+
+def load_ini_config(path="config.ini"):
+    config_path = resolve_runtime_file(path)
+    if not config_path.exists():
+        return None
+
+    parser = configparser.ConfigParser()
+    with open(config_path, "r", encoding="utf-8") as f:
+        parser.read_file(f)
+
+    if parser.has_section("database"):
+        cfg = dict(parser.items("database"))
+    else:
+        cfg = dict(parser.defaults())
+
+    return _normalize_database_config(cfg)
+
+
+def load_text_config(path="config.txt"):
+    config_path = resolve_runtime_file(path)
+    if not config_path.exists():
+        return None
+
+    cfg = {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                continue
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+            elif ":" in line:
+                key, value = line.split(":", 1)
+            else:
+                continue
+
+            cfg[key.strip()] = value.strip()
+
+    return _normalize_database_config(cfg)
+
+
+def load_config():
+    config_candidates = [
+        ("config.yaml", load_yaml_config),
+        ("config.yml", load_yaml_config),
+        ("config.py", load_python_config),
+        ("config.ini", load_ini_config),
+        ("config.txt", load_text_config),
+    ]
+
+    for filename, loader in config_candidates:
+        config_path = resolve_runtime_file(filename)
+        if not config_path.exists():
+            continue
+        return loader(filename)
+
+    raise FileNotFoundError(
+        "config.yaml/config.yml/config.py/config.ini/config.txt not found"
+    )
+
+
+config = load_config()
+
 
 cipher_alg_id = {
     "sm4_ebc": 0x00000401,
@@ -25,7 +200,6 @@ hash_alg_id = {
 
 
 class Digest:
-
     def __init__(self, session, alg_name="sm3"):
         if hash_alg_id[alg_name] is None:
             raise Exception("unsupported hash alg {}".format(alg_name))
@@ -57,7 +231,9 @@ class PiicoError(Exception):
         self.__msg = msg
 
     def __str__(self):
-        return "piico error: {} return code: {}".format(self.__msg, self.hex_ret(self.__ret))
+        return "piico error: {} return code: {}".format(
+            self.__msg, self.hex_ret(self.__ret)
+        )
 
     @staticmethod
     def hex_ret(ret):
@@ -78,7 +254,6 @@ class ECCCipher:
 
 
 class EBCCipher:
-
     def __init__(self, session, key_val):
         self._session = session
         self._key = self.__get_key(key_val)
@@ -93,28 +268,33 @@ class EBCCipher:
     def __padding(val):
         val = bytes(val)
         while len(val) == 0 or len(val) % 16 != 0:
-            val += b'\0'
+            val += b"\0"
         return val
 
     def encrypt(self, plain_text):
         plain_text = self.__padding(plain_text)
-        cipher_text = self._session.encrypt(plain_text, self._key, cipher_alg_id[self._alg], self._iv)
+        cipher_text = self._session.encrypt(
+            plain_text, self._key, cipher_alg_id[self._alg], self._iv
+        )
         return bytes(cipher_text)
 
     def decrypt(self, cipher_text):
-        plain_text = self._session.decrypt(cipher_text, self._key, cipher_alg_id[self._alg], self._iv)
+        plain_text = self._session.decrypt(
+            cipher_text, self._key, cipher_alg_id[self._alg], self._iv
+        )
         return bytes(plain_text)
 
     def destroy(self):
         self._session.destroy_cipher_key(self._key)
         self._session.close()
 
-class CBCCipher(EBCCipher):
 
+class CBCCipher(EBCCipher):
     def __init__(self, session, key, iv):
         super().__init__(session, key)
         self._iv = iv
         self._alg = "sm4_cbc"
+
 
 class EncodeMixin:
     def encode(self):
@@ -123,9 +303,9 @@ class EncodeMixin:
 
 class ECCrefPublicKey(Structure, EncodeMixin):
     _fields_ = [
-        ('bits', c_uint),
-        ('x', c_ubyte * ECCref_MAX_LEN),
-        ('y', c_ubyte * ECCref_MAX_LEN),
+        ("bits", c_uint),
+        ("x", c_ubyte * ECCref_MAX_LEN),
+        ("y", c_ubyte * ECCref_MAX_LEN),
     ]
 
     def encode(self):
@@ -134,8 +314,11 @@ class ECCrefPublicKey(Structure, EncodeMixin):
 
 class ECCrefPrivateKey(Structure, EncodeMixin):
     _fields_ = [
-        ('bits', c_uint,),
-        ('K', c_ubyte * ECCref_MAX_LEN),
+        (
+            "bits",
+            c_uint,
+        ),
+        ("K", c_ubyte * ECCref_MAX_LEN),
     ]
 
     def encode(self):
@@ -143,7 +326,6 @@ class ECCrefPrivateKey(Structure, EncodeMixin):
 
 
 class ECCCipherEncode(EncodeMixin):
-
     def __init__(self):
         self.x = None
         self.y = None
@@ -153,7 +335,7 @@ class ECCCipherEncode(EncodeMixin):
 
     def encode(self):
         c1 = bytes(self.x[32:]) + bytes(self.y[32:])
-        c2 = bytes(self.C[:self.L])
+        c2 = bytes(self.C[: self.L])
         c3 = bytes(self.M)
         return bytes([0x04]) + c1 + c2 + c3
 
@@ -164,15 +346,19 @@ def new_ecc_cipher_cla(length):
     if _cache.__contains__(cla_name):
         return _cache[cla_name]
     else:
-        cla = type(cla_name, (Structure, ECCCipherEncode), {
-            "_fields_": [
-                ('x', c_ubyte * ECCref_MAX_LEN),
-                ('y', c_ubyte * ECCref_MAX_LEN),
-                ('M', c_ubyte * 32),
-                ('L', c_uint),
-                ('C', c_ubyte * length)
-            ]
-        })
+        cla = type(
+            cla_name,
+            (Structure, ECCCipherEncode),
+            {
+                "_fields_": [
+                    ("x", c_ubyte * ECCref_MAX_LEN),
+                    ("y", c_ubyte * ECCref_MAX_LEN),
+                    ("M", c_ubyte * 32),
+                    ("L", c_uint),
+                    ("C", c_ubyte * length),
+                ]
+            },
+        )
         _cache[cla_name] = cla
         return cla
 
@@ -182,8 +368,8 @@ class ECCKeyPair:
         self.public_key = public_key
         self.private_key = private_key
 
-class BaseMixin:
 
+class BaseMixin:
     def __init__(self):
         self._driver = None
         self._session = None
@@ -193,17 +379,25 @@ class SM2Mixin(BaseMixin):
     def ecc_encrypt(self, public_key, plain_text, alg_id):
 
         pos = 1
-        k1 = bytes([0] * 32) + bytes(public_key[pos:pos + 32])
+        k1 = bytes([0] * 32) + bytes(public_key[pos : pos + 32])
         k1 = (c_ubyte * len(k1))(*k1)
         pos += 32
-        k2 = bytes([0] * 32) + bytes(public_key[pos:pos + 32])
+        k2 = bytes([0] * 32) + bytes(public_key[pos : pos + 32])
 
-        pk = ECCrefPublicKey(c_uint(0x40), (c_ubyte * len(k1))(*k1), (c_ubyte * len(k2))(*k2))
+        pk = ECCrefPublicKey(
+            c_uint(0x40), (c_ubyte * len(k1))(*k1), (c_ubyte * len(k2))(*k2)
+        )
 
         plain_text = (c_ubyte * len(plain_text))(*plain_text)
         ecc_data = new_ecc_cipher_cla(len(plain_text))()
-        ret = self._driver.SDF_ExternalEncrypt_ECC(self._session, c_int(alg_id), pointer(pk), plain_text,
-                                                   c_int(len(plain_text)), pointer(ecc_data))
+        ret = self._driver.SDF_ExternalEncrypt_ECC(
+            self._session,
+            c_int(alg_id),
+            pointer(pk),
+            plain_text,
+            c_int(len(plain_text)),
+            pointer(ecc_data),
+        )
         if ret != 0:
             raise Exception("ecc encrypt failed", ret)
         return ecc_data.encode()
@@ -215,9 +409,9 @@ class SM2Mixin(BaseMixin):
 
         pos = 1
         # c1
-        x = bytes([0] * 32) + bytes(cipher_text[pos:pos + 32])
+        x = bytes([0] * 32) + bytes(cipher_text[pos : pos + 32])
         pos += 32
-        y = bytes([0] * 32) + bytes(cipher_text[pos:pos + 32])
+        y = bytes([0] * 32) + bytes(cipher_text[pos : pos + 32])
         pos += 32
 
         # c2
@@ -236,17 +430,24 @@ class SM2Mixin(BaseMixin):
         )
         temp_data = (c_ubyte * l)()
         temp_data_length = c_int()
-        ret = self._driver.SDF_ExternalDecrypt_ECC(self._session, c_int(alg_id), pointer(vk),
-                                                   pointer(ecc_data),
-                                                   temp_data, pointer(temp_data_length))
+        ret = self._driver.SDF_ExternalDecrypt_ECC(
+            self._session,
+            c_int(alg_id),
+            pointer(vk),
+            pointer(ecc_data),
+            temp_data,
+            pointer(temp_data_length),
+        )
         if ret != 0:
             raise Exception("ecc decrypt failed", ret)
-        return bytes(temp_data[:temp_data_length.value])
+        return bytes(temp_data[: temp_data_length.value])
 
 
 class SM3Mixin(BaseMixin):
     def hash_init(self, alg_id):
-        ret = self._driver.SDF_HashInit(self._session, c_int(alg_id), None, None, c_int(0))
+        ret = self._driver.SDF_HashInit(
+            self._session, c_int(alg_id), None, None, c_int(0)
+        )
         if ret != 0:
             raise PiicoError("hash init failed,alg id is {}".format(alg_id), ret)
 
@@ -259,20 +460,23 @@ class SM3Mixin(BaseMixin):
     def hash_final(self):
         result_data = (c_ubyte * 32)()
         result_length = c_int()
-        ret = self._driver.SDF_HashFinal(self._session, result_data, pointer(result_length))
+        ret = self._driver.SDF_HashFinal(
+            self._session, result_data, pointer(result_length)
+        )
         if ret != 0:
             raise PiicoError("hash final failed", ret)
-        return bytes(result_data[:result_length.value])
+        return bytes(result_data[: result_length.value])
 
 
 class SM4Mixin(BaseMixin):
-
     def import_key(self, key_val):
         # to c lang
         key_val = (c_ubyte * len(key_val))(*key_val)
 
         key = c_void_p()
-        ret = self._driver.SDF_ImportKey(self._session, key_val, c_int(len(key_val)), pointer(key))
+        ret = self._driver.SDF_ImportKey(
+            self._session, key_val, c_int(len(key_val)), pointer(key)
+        )
         if ret != 0:
             raise PiicoError("import key failed", ret)
         return key
@@ -296,16 +500,32 @@ class SM4Mixin(BaseMixin):
         temp_data = (c_ubyte * len(text))()
         temp_data_length = c_int()
         if encrypt:
-            ret = self._driver.SDF_Encrypt(self._session, key, c_int(alg), iv, text, c_int(len(text)), temp_data,
-                                           pointer(temp_data_length))
+            ret = self._driver.SDF_Encrypt(
+                self._session,
+                key,
+                c_int(alg),
+                iv,
+                text,
+                c_int(len(text)),
+                temp_data,
+                pointer(temp_data_length),
+            )
             if ret != 0:
                 raise PiicoError("encrypt failed", ret)
         else:
-            ret = self._driver.SDF_Decrypt(self._session, key, c_int(alg), iv, text, c_int(len(text)), temp_data,
-                                           pointer(temp_data_length))
+            ret = self._driver.SDF_Decrypt(
+                self._session,
+                key,
+                c_int(alg),
+                iv,
+                text,
+                c_int(len(text)),
+                temp_data,
+                pointer(temp_data_length),
+            )
             if ret != 0:
                 raise PiicoError("decrypt failed", ret)
-        return temp_data[:temp_data_length.value]
+        return temp_data[: temp_data_length.value]
 
 
 def get_mysql_conn():
@@ -315,7 +535,7 @@ def get_mysql_conn():
             port=config.port,
             user=config.user,
             password=config.password,
-            database=config.database
+            database=config.database,
         )
         return conn
     except pymysql.MySQLError as e:
@@ -345,8 +565,13 @@ class Session(SM2Mixin, SM3Mixin, SM4Mixin):
     def generate_ecc_key_pair(self, alg_id):
         public_key = ECCrefPublicKey()
         private_key = ECCrefPrivateKey()
-        ret = self._driver.SDF_GenerateKeyPair_ECC(self._session, c_int(alg_id), c_int(256), pointer(public_key),
-                                                   pointer(private_key))
+        ret = self._driver.SDF_GenerateKeyPair_ECC(
+            self._session,
+            c_int(alg_id),
+            c_int(256),
+            pointer(public_key),
+            pointer(private_key),
+        )
         if ret != 0:
             raise PiicoError("generate ecc key pair failed", ret)
         return ECCKeyPair(public_key.encode(), private_key.encode())
@@ -355,6 +580,7 @@ class Session(SM2Mixin, SM3Mixin, SM4Mixin):
         ret = self._driver.SDF_CloseSession(self._session)
         if ret != 0:
             raise PiicoError("close session failed", ret)
+
 
 class Device:
     _driver = None
@@ -425,16 +651,17 @@ def open_piico_device(driver_path) -> Device:
     d.open(driver_path)
     return d
 
+
 def get_jp_info(conn):
     result = ()
     try:
         # sql = 'select accounts_account.`name` as account_name, accounts_account.username, accounts_account.secret_type, accounts_account._secret as secret, accounts_account.is_active, assets_asset.address, assets_asset.`name` as asset_name, assets_platform.`name` as platform_name, assets_platform.type from accounts_account INNER JOIN assets_asset ON accounts_account.asset_id=assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id=assets_platform.id;'
-        sql = 'select accounts_account.`name` as account_name, accounts_account.username, accounts_account.secret_type, accounts_account.secret, accounts_account.is_active, assets_asset.address, assets_asset.`name` as asset_name, assets_platform.`name` as platform_name, assets_platform.type from accounts_account INNER JOIN assets_asset ON accounts_account.asset_id=assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id=assets_platform.id;'
+        sql = "select accounts_account.`name` as account_name, accounts_account.username, accounts_account.secret_type, accounts_account.secret, accounts_account.is_active, assets_asset.address, assets_asset.`name` as asset_name, assets_platform.`name` as platform_name, assets_platform.type from accounts_account INNER JOIN assets_asset ON accounts_account.asset_id=assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id=assets_platform.id;"
         cursor = conn.cursor(cursors.DictCursor)
         cursor.execute(sql)
         result = cursor.fetchall()
     except Exception as e:
-        sql = 'select accounts_account.`name` as account_name, accounts_account.username, accounts_account.secret_type, accounts_account._secret as secret, accounts_account.is_active, assets_asset.address, assets_asset.`name` as asset_name, assets_platform.`name` as platform_name, assets_platform.type from accounts_account INNER JOIN assets_asset ON accounts_account.asset_id=assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id=assets_platform.id;'
+        sql = "select accounts_account.`name` as account_name, accounts_account.username, accounts_account.secret_type, accounts_account._secret as secret, accounts_account.is_active, assets_asset.address, assets_asset.`name` as asset_name, assets_platform.`name` as platform_name, assets_platform.type from accounts_account INNER JOIN assets_asset ON accounts_account.asset_id=assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id=assets_platform.id;"
         # sql = 'select accounts_account.`name` as account_name, accounts_account.username, accounts_account.secret_type, accounts_account.secret, accounts_account.is_active, assets_asset.address, assets_asset.`name` as asset_name, assets_platform.`name` as platform_name, assets_platform.type from accounts_account INNER JOIN assets_asset ON accounts_account.asset_id=assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id=assets_platform.id;'
         cursor = conn.cursor(cursors.DictCursor)
         cursor.execute(sql)
@@ -445,32 +672,52 @@ def get_jp_info(conn):
 
 
 def get_postgresql_conn():
-    conn = psycopg2.connect(dbname=config.database, user=config.user, password=config.password, host=config.host, port=config.port)
+    conn = psycopg2.connect(
+        dbname=config.database,
+        user=config.user,
+        password=config.password,
+        host=config.host,
+        port=config.port,
+    )
     cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-    sql = 'SELECT accounts_account.name AS account_name,accounts_account.username,accounts_account.secret_type,accounts_account._secret AS secret,accounts_account.is_active,assets_asset.address,assets_asset.name AS asset_name,assets_platform.name AS platform_name,assets_platform.type FROM accounts_account INNER JOIN assets_asset ON accounts_account.asset_id = assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id = assets_platform.id;'
+    sql = "SELECT accounts_account.name AS account_name,accounts_account.username,accounts_account.secret_type,accounts_account._secret AS secret,accounts_account.is_active,assets_asset.address,assets_asset.name AS asset_name,assets_platform.name AS platform_name,assets_platform.type FROM accounts_account INNER JOIN assets_asset ON accounts_account.asset_id = assets_asset.id INNER JOIN assets_platform ON assets_asset.platform_id = assets_platform.id;"
     cursor.execute(sql)
     result = cursor.fetchall()
     conn.close()
     # 需要转成 list[dict]，跟 MySQL 统一
     return [dict(row) for row in result]
 
+
 def read_text_file(file_path):
     try:
-        with open(file_path, 'r') as file:
+        with open(file_path, "r") as file:
             return file.read()
     except FileNotFoundError:
         print(f"File not found: {file_path}")
         return None
 
+
 def write_data_to_file(file, data):
-    writer = csv.DictWriter(file, fieldnames=['account_name', 'username', 'secret_type', 'secret', 'is_active', 'address', 'asset_name', 'platform_name', 'type'])
+    writer = csv.DictWriter(
+        file,
+        fieldnames=[
+            "account_name",
+            "username",
+            "secret_type",
+            "secret",
+            "is_active",
+            "address",
+            "asset_name",
+            "platform_name",
+            "type",
+        ],
+    )
     writer.writeheader()
     for e in tqdm(data):
         crypto = math.Crypto(e, config.SECRET_KEY)
-        e['secret'] = crypto.decrypt()
+        e["secret"] = crypto.decrypt()
         writer.writerow(e)
-
 
 
 if __name__ == "__main__":
@@ -482,6 +729,6 @@ if __name__ == "__main__":
     if config.type == 2:
         result = get_postgresql_conn()
 
-    f = open("jumpserver.csv", 'w', newline='')
+    f = open("jumpserver.csv", "w", newline="")
     write_data_to_file(f, result)
     f.close()
